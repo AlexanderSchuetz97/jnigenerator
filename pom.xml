@@ -7,7 +7,7 @@
     <groupId>io.github.alexanderschuetz97</groupId>
     <artifactId>jnigenerator</artifactId>
     <packaging>maven-plugin</packaging>
-    <version>1.0</version>
+    <version>1.3</version>
 
     <name>${project.groupId}:${project.artifactId}</name>
     <description>Collection of jni wrappers for various native system calls</description>
@@ -117,6 +117,11 @@
         <dependency>
             <groupId>org.apache.maven</groupId>
             <artifactId>maven-project</artifactId>
+            <version>2.2.1</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.maven</groupId>
+            <artifactId>maven-artifact</artifactId>
             <version>2.2.1</version>
         </dependency>
         <dependency>

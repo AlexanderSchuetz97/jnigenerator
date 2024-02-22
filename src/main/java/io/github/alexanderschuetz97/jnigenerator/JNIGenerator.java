@@ -27,6 +27,8 @@ import org.apache.bcel.generic.ArrayType;
 import org.apache.bcel.generic.ObjectType;
 import org.apache.bcel.generic.Type;
 import org.apache.bcel.util.ClassPath;
+import org.apache.maven.artifact.DependencyResolutionRequiredException;
+import org.apache.maven.model.Dependency;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.plugin.MojoFailureException;
@@ -47,6 +49,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 @Mojo(name = "jnigenerator",
         defaultPhase = LifecyclePhase.PROCESS_CLASSES,
@@ -66,6 +70,9 @@ public class JNIGenerator extends AbstractMojo {
     @Parameter(property = "exceptions")
     protected Member[] exceptions;
 
+    @Parameter(property = "consts")
+    protected Const[] consts;
+
     @Parameter(property = "headerOutput")
     protected String headerOutput;
 
@@ -81,13 +88,23 @@ public class JNIGenerator extends AbstractMojo {
     @Parameter(property = "builderDir")
     protected String builderDir;
 
+
+    @Parameter(property = "gen")
+    protected boolean gen = true;
+
     @Override
     public void execute() throws MojoExecutionException, MojoFailureException {
-        try {
-            generate();
-        } catch (Throwable e) {
-            getLog().error(e);
-            throw new MojoExecutionException("it died", e);
+        if (gen) {
+            try {
+                generate();
+            } catch (Throwable e) {
+                getLog().error(e);
+                throw new MojoExecutionException("it died", e);
+            }
+        }
+
+        if (!gen) {
+            getLog().error("WILL NOT GENERATE ANYTHING");
         }
 
         build();
@@ -120,6 +137,7 @@ public class JNIGenerator extends AbstractMojo {
 
         Map<String, Member> structsSet = new TreeMap<>();
         Map<String, Member> exceptionsSet = new TreeMap<>();
+        Map<String, Const> constSet = new TreeMap<>();
 
         if (structs != null) {
             for (Member member : structs) {
@@ -133,16 +151,20 @@ public class JNIGenerator extends AbstractMojo {
             }
         }
 
+        if (consts != null) {
+            for (Const member : consts) {
+                constSet.put(member.getClassname(), member);
+            }
+        }
+
         structsSet.remove("java.lang.Enum");
         structsSet.remove("java.lang.String");
-
-
-
 
 
         Set<String> allClasses = new TreeSet<>();
         allClasses.addAll(structsSet.keySet());
         allClasses.addAll(exceptionsSet.keySet());
+        allClasses.addAll(constSet.keySet());
 
         Map<String, JavaClass> jclasses = getClasses(allClasses);
 
@@ -160,13 +182,19 @@ public class JNIGenerator extends AbstractMojo {
             generateException(generation, exceptionsSet.get(exc), jclasses.get(exc));
         }
 
+        for (String exc : constSet.keySet()) {
+            generateConst(generation, constSet.get(exc), jclasses.get(exc));
+        }
+
+
 
 
         finish(generation);
     }
 
-    public Map<String, JavaClass> getClasses(Set<String> needed) throws IOException {
+    private Map<String, JavaClass> getClassesFromDirectory(File dir, Set<String> needed) throws IOException {
         final List<File> classFiles = new ArrayList<>();
+
         Files.walkFileTree(classes.toPath(), new FileVisitor<Path>() {
             @Override
             public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
@@ -200,17 +228,84 @@ public class JNIGenerator extends AbstractMojo {
                 ClassParser parser = new ClassParser(fais, f.getAbsolutePath());
                 JavaClass javaClass = parser.parse();
                 if (needed.contains(javaClass.getClassName())) {
+                    System.out.println("Found " + javaClass.getClassName() + " in directory " + dir.getName());
                     classes.put(javaClass.getClassName(), javaClass);
                 }
             }
         }
+
+        return classes;
+    }
+
+    private Map<String, JavaClass> getClassesFromZip(File zip, Set<String> needed) throws IOException {
+        Map<String, JavaClass> classes = new HashMap<>();
+
+        try(ZipInputStream zipIn = new ZipInputStream(new FileInputStream(zip))) {
+            while(true) {
+                ZipEntry zipE = zipIn.getNextEntry();
+                if (zipE == null) {
+                    break;
+                }
+
+                if (zipE.isDirectory()) {
+                    continue;
+                }
+
+                if (!zipE.getName().endsWith(".class")) {
+                    continue;
+                }
+
+                ClassParser parser = new ClassParser(zipIn, zipE.getName());
+                JavaClass javaClass = parser.parse();
+                if (needed.contains(javaClass.getClassName())) {
+                    System.out.println("Found " + javaClass.getClassName() + " in zip " + zip.getName());
+                    classes.put(javaClass.getClassName(), javaClass);
+                }
+            }
+        }
+
+        return classes;
+    }
+
+    public Map<String, JavaClass> getClasses(Set<String> needed) throws IOException {
+
+
+
+        List dependencies;
+        try {
+            dependencies = new ArrayList(project.getRuntimeClasspathElements());
+            dependencies.addAll(project.getCompileClasspathElements());
+        } catch (DependencyResolutionRequiredException e) {
+            throw new IOException(e);
+        }
+
+        Map<String, JavaClass> classes = new HashMap<>();
+        Set<String> alreadyProcessed = new HashSet<>();
+        for (Object o : dependencies) {
+            String dep = String.valueOf(o);
+            if (!alreadyProcessed.add(dep)) {
+                continue;
+            }
+            System.out.println("Processing dependency: " + dep);
+            File f = new File(dep);
+            if (!f.exists()) {
+                System.err.println("Classpath element not found " + f.getAbsolutePath());
+                continue;
+            }
+            if (f.isDirectory()) {
+                classes.putAll(getClassesFromDirectory(f, needed));
+                continue;
+            }
+
+            classes.putAll(getClassesFromZip(f, needed));
+        }
+
 
         needed.removeAll(classes.keySet());
         for (String sn : needed) {
             JavaClass clazz = getClass(sn);
             classes.put(sn, clazz);
         }
-
 
         return classes;
     }
@@ -318,7 +413,7 @@ public class JNIGenerator extends AbstractMojo {
                 "        return 0;",
                 "    }",
                 "    if (len == 0) {",
-                "        return 0;",
+                "        return res;",
                 "    }",
                 "    if (buffer == 0) {",
                 "        (*env)->DeleteLocalRef(env, res);",
@@ -820,9 +915,81 @@ public class JNIGenerator extends AbstractMojo {
 
 
     }
+    protected void generateConst(Generation generation, Const member, JavaClass clazz) {
+
+        String scn = simpleClassName(clazz.getClassName());
+        String nat = nativeClassName(clazz.getClassName());
+
+        Set<String> filtered = new HashSet<>();
+        if (member.getConstFilters() != null) {
+            filtered.addAll(Arrays.asList(member.getConstFilters()));
+        }
+
+        StringBuilder header = new StringBuilder();
+        header.append("//THIS FILE IS MACHINE GENERATED, DO NOT EDIT\n");
+        header.append("#include <jni.h>\n");
+        header.append("void jfetchconst_" + scn + "(JNIEnv * env, jobject instance);\n");
+
+        StringBuilder code = new StringBuilder();
+        code.append("//THIS FILE IS MACHINE GENERATED, DO NOT EDIT\n");
+
+        for (String mem : member.getHeaders()) {
+            code.append(mem);
+            code.append("\n");
+        }
+
+        code.append("\n");
+        code.append("void jfetchconst_" + scn + "(JNIEnv * env, jobject instance) {\n");
+
+        for (Field f : clazz.getFields()) {
+            Type type = f.getType();
+            if (type.getSignature().length() != 1) {
+                continue;
+            }
+
+            String name = f.getName();
+            if (filtered.contains(name)) {
+                continue;
+            }
+
+            String cType = getCType(type);
+            code.append("   jset_" + scn + "_" + name + "(env, instance, (" + cType + ") " + f.getName() + ");\n");
+        }
+
+        code.append("}\n");
+
+
+        try {
+            File f = new File(member.getCodeFile());
+            if (f.exists()) {
+                f.delete();
+            }
+
+            f.createNewFile();
+
+            try(FileOutputStream faos = new FileOutputStream(f)) {
+                faos.write(code.toString().getBytes(StandardCharsets.UTF_8));
+            }
+
+            f = new File(member.getHeaderFile());
+            if (f.exists()) {
+                f.delete();
+            }
+
+            f.createNewFile();
+
+            try(FileOutputStream faos = new FileOutputStream(f)) {
+                faos.write(header.toString().getBytes(StandardCharsets.UTF_8));
+            }
+
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+
+    }
+
 
     protected void generateStruct(Generation generation, Member member, JavaClass clazz) {
-
         String scn = simpleClassName(clazz.getClassName());
         String nat = nativeClassName(clazz.getClassName());
 
@@ -863,10 +1030,17 @@ public class JNIGenerator extends AbstractMojo {
                         "        (*env) -> ThrowNew(env, Exception, \"cant find " + nat + "_" + name + "_" + sig + "\");",
                         "        return JNI_FALSE;",
                         "    }",
-                        "    " + nativeFieldName + " = (*env) -> GetStaticObjectField(env, " + scn + ", " + enumFieldInit + ");",
-                        "    if (" + nativeFieldName + " == 0) {",
+                        "    jobject enum_field_init_local_" + nativeFieldName + " = (*env) -> GetStaticObjectField(env, " + scn + ", " + enumFieldInit + ");",
+                        "    if (enum_field_init_local_" + nativeFieldName + " == 0) {",
                         "        (*env) -> ExceptionClear(env);",
                         "        (*env) -> ThrowNew(env, Exception, \"cant get enum value of " + nat + "_" + name + "_" + sig + "\");",
+                        "        return JNI_FALSE;",
+                        "    }",
+                        "    " + nativeFieldName + " = (*env)->NewGlobalRef(env, enum_field_init_local_"+nativeFieldName+");",
+                        "    (*env)->DeleteLocalRef(env, enum_field_init_local_"+nativeFieldName+");",
+                        "    if (" + nativeFieldName + " == 0) {",
+                        "        (*env) -> ExceptionClear(env);",
+                        "        (*env) -> ThrowNew(env, Exception, \"cant create global ref to enum value of " + nat + "_" + name + "_" + sig + "\");",
                         "        return JNI_FALSE;",
                         "    }",
                         "    ");
@@ -1217,6 +1391,9 @@ public class JNIGenerator extends AbstractMojo {
     protected void finish(Generation generation) throws IOException {
         File header = new File(headerOutput);
         File impl = new File(implOutput);
+
+        System.out.println(header.getAbsolutePath());
+        System.out.println(impl.getAbsolutePath());
 
         header.delete();
         header.createNewFile();
